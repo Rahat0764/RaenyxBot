@@ -203,6 +203,31 @@ public:
 
 NewI2SOut* audioOut = nullptr;
 
+// Startup beep: two soft tones through the speaker path the moment the
+// speaker is ready — before WiFi/server — so a beep at power-on means
+// "board + speaker OK", and silence points at the speaker/amp/wiring.
+void startupBeep() {
+  if (!audioOut) return;
+  const int rate = 16000;
+  const float tones[2] = {880.0f, 1318.5f};  // A5 -> E6 "ready" chirp
+  const int durs[2] = {110, 170};            // ms per tone
+  for (int t = 0; t < 2; t++) {
+    int n = rate * durs[t] / 1000;
+    int fadeIn = rate / 100;                 // 10 ms, avoids a click
+    int fadeOut = rate / 50;                 // 20 ms
+    for (int i = 0; i < n; i++) {
+      float ph = 2.0f * (float)M_PI * tones[t] * i / rate;
+      float env = 1.0f;
+      if (i < fadeIn) env = (float)i / fadeIn;
+      else if (i > n - fadeOut) env = (float)(n - i) / fadeOut;
+      int16_t v = (int16_t)(sinf(ph) * 11000.0f * env);
+      int16_t s[2] = {v, v};
+      audioOut->ConsumeSample(s);
+    }
+  }
+  audioOut->stop();
+}
+
 void spkInit() {
   i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   cc.dma_desc_num = 8;
@@ -1039,6 +1064,7 @@ void setup() {
   audioOut = new NewI2SOut();
   audioOut->SetRate(16000);
   audioOut->SetChannels(1);
+  startupBeep();  // speaker self-test: beep = board + speaker OK
 
   connectWiFi();
   if (!fetchSongs()) { delay(1500); fetchSongs(); }  // server may be waking up
