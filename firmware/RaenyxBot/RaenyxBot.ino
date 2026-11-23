@@ -29,7 +29,14 @@
 #include "AudioFileSourceHTTPStream.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutput.h"
-#include "config.h"
+
+// ==========================================================================
+//  FILL THESE THREE IN, then upload this single .ino file. That's it.
+//  (No API keys go here - the Gemini key lives only on the server.)
+// ==========================================================================
+const char* WIFI_SSID   = "YOUR_SSID_HERE";       // <-- your WiFi name here
+const char* WIFI_PASS   = "YOUR_PASSWORD_HERE";   // <-- your WiFi password here
+const char* SERVER_BASE = "https://raenyxbot.onrender.com";  // <-- your Render server URL here (no trailing slash)
 
 #define GREETING "Hello! I'm Raenyx, your voice assistant. Tell me, what would you like to know?"
 

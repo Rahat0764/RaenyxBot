@@ -32,8 +32,7 @@ background artwork and real-time synced lyrics.
 ## Repo layout
 
 ```
-firmware/RaenyxBot/RaenyxBot.ino   the ESP32 sketch (open this in Arduino IDE)
-firmware/RaenyxBot/config.h        WiFi + server URL (edit before uploading)
+firmware/RaenyxBot/RaenyxBot.ino   the ESP32 sketch - the ONLY file you upload
 server/app.py                      FastAPI server: Gemini proxy + song library
 server/requirements.txt
 server/songs/                      blue.mp3 / blue.lrc / blue.jpg go here
@@ -68,7 +67,9 @@ render.yaml                        one-click Render blueprint
 ### 2. Device
 
 1. Open `firmware/RaenyxBot/RaenyxBot.ino` in the Arduino IDE.
-2. Edit `config.h`: your WiFi name/password and `SERVER_BASE` (step 1.3).
+2. At the **top of the .ino file** fill in the three marked lines:
+   `WIFI_SSID`, `WIFI_PASS` and `SERVER_BASE` (your Render URL, step 1.3).
+   Nothing else needs editing - it is a single-file sketch.
 3. Libraries: **LovyanGFX**, **ArduinoJson**, **ESP8266Audio**.
    Board: ESP32-S3, **PSRAM enabled**.
 4. Upload, touch the screen, and talk.
