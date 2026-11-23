@@ -95,7 +95,7 @@ FALLBACK_MODELS = _parse_csv("GEMINI_FALLBACK_MODELS") or ["gemini-3.5-flash-lit
 GROQ_API_KEYS = _parse_csv("GROQ_API_KEYS") or _parse_csv("GROQ_API_KEY")
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_CHAT_MODEL = os.environ.get("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
-GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3")
 TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
 
@@ -157,7 +157,14 @@ def _client_for(idx: int):
         # answers "model not found" for them.
         _clients[idx] = genai.Client(
             api_key=GEMINI_API_KEYS[idx],
-            http_options=types.HttpOptions(api_version="v1beta"),
+            http_options=types.HttpOptions(
+                api_version="v1beta",
+                # Fail a stuck/bad key fast: our own key rotation is the
+                # retry mechanism, so the SDK must not sit retrying one
+                # key with backoff while the ESP32 times out (20 s).
+                timeout=20000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
         )
     return _clients[idx]
 
@@ -310,6 +317,16 @@ def groq_transcribe(audio: bytes) -> str:
             ).encode(),
             (
                 f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="temperature"\r\n\r\n'
+                f"0\r\n"
+            ).encode(),
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+                f"A conversation in Bangla and English.\r\n"
+            ).encode(),
+            (
+                f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="file"; '
                 f'filename="audio.wav"\r\n'
                 f"Content-Type: audio/wav\r\n\r\n"
@@ -447,6 +464,7 @@ def _startup():
     tg_log(
         "🟢 RaenyxBot server started\n"
         f"🔑 Gemini keys loaded: {len(GEMINI_API_KEYS)}\n"
+        f"⚡ Groq keys loaded: {len(GROQ_API_KEYS)} (primary for chat + transcribe)\n"
         f"🎵 Songs ({len(songs)}): {names}"
     )
     # Register the Telegram webhook so authorized users can send commands.
@@ -493,6 +511,7 @@ async def telegram_webhook(request: Request):
             "🤖 RaenyxBot server is running\n"
             f"⏱ Uptime: {up // 3600}h {(up % 3600) // 60}m\n"
             f"🔑 Gemini keys: {len(GEMINI_API_KEYS)} (active #{_key_idx + 1})\n"
+            f"⚡ Groq keys: {len(GROQ_API_KEYS)} (active #{_groq_idx + 1}) — primary for chat + transcribe\n"
             f"🎵 Songs: {len(scan_songs())}"
         )
     elif cmd == "/songs":
@@ -502,7 +521,9 @@ async def telegram_webhook(request: Request):
     elif cmd == "/keys":
         reply = (
             f"🔑 {len(GEMINI_API_KEYS)} Gemini keys loaded, "
-            f"currently using #{_key_idx + 1}. "
+            f"currently using #{_key_idx + 1}.\n"
+            f"⚡ {len(GROQ_API_KEYS)} Groq keys loaded, "
+            f"currently using #{_groq_idx + 1} (primary for chat + transcribe).\n"
             "A failing key is skipped automatically."
         )
     else:
@@ -549,11 +570,39 @@ class TtsIn(BaseModel):
     voice: str | None = None
 
 
+_tts_cache: dict = {}  # (text, voice) -> WAV bytes
+
+
+def _wav_energy(audio: bytes):
+    """(peak, rms) of a 16-bit PCM WAV's data chunk; (0, 0) if unparsable."""
+    try:
+        i = audio.find(b"data")
+        if i < 0:
+            return 0, 0.0
+        pcm = audio[i + 8:]
+        n = len(pcm) // 2
+        if n == 0:
+            return 0, 0.0
+        samples = struct.unpack(f"<{n}h", pcm[: n * 2])
+        peak = max(max(samples), -min(samples))
+        rms = (sum(s * s for s in samples) / n) ** 0.5
+        return peak, rms
+    except Exception:
+        return 0, 0.0
+
+
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...)):
     audio = await file.read()
     if len(audio) < 1000:
         raise HTTPException(400, "audio too short")
+    peak, rms = _wav_energy(audio)
+    if peak < 250:
+        # Near-silence (a fan gust, a bump, room noise tripping the mic):
+        # Whisper would only hallucinate words into it — the famous
+        # phantom "Thank you." on silence. Answer "heard nothing" instead.
+        print(f"[stt] silence gate: peak={peak} rms={rms:.0f} -> empty")
+        return {"text": ""}
 
     # Groq (Whisper) is the primary ear; Gemini is the fallback.
     if GROQ_API_KEYS:
@@ -660,5 +709,13 @@ def tts(body: TtsIn):
         return base64.b64decode(out.data)
 
     # TTS is Gemini-only: Groq's TTS (Orpheus) has no Bangla voice.
+    # Cache by text: the greeting and stock replies repeat constantly,
+    # and a cached answer is instant instead of a fresh Gemini call.
+    cache_key = (text, body.voice or TTS_VOICE)
+    if cache_key in _tts_cache:
+        return Response(content=_tts_cache[cache_key], media_type="audio/wav")
     wav = run_gemini(_do, "tts")
+    if len(_tts_cache) > 40:
+        _tts_cache.clear()
+    _tts_cache[cache_key] = wav
     return Response(content=wav, media_type="audio/wav")

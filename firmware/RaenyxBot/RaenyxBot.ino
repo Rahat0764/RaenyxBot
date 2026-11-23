@@ -26,7 +26,7 @@
 #include <vector>
 #include <driver/i2s_std.h>
 #include <LovyanGFX.hpp>
-#include "AudioFileSourceHTTPStream.h"
+#include "AudioFileSourceBuffer.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutput.h"
 
@@ -56,7 +56,7 @@ const char* SERVER_BASE = "https://raenyxbot.onrender.com";  // <-- your Render 
 #define PREROLL         2048
 #define MAX_SAMPLES     160000
 #define END_SILENCE     28
-#define MIN_VOICED      6
+#define MIN_VOICED      10
 #define WAIT_MS         12000
 #define HEAD_RESERVE    768
 #define WAV_HDR         44
@@ -884,12 +884,81 @@ void parseLrc(const uint8_t* buf, size_t len) {
   Serial.printf("[LRC] %u lines\n", (unsigned)lyrics.size());
 }
 
+// --------------------------------------------------- song https streaming --
+// AudioFileSourceHTTPStream cannot stream our songs: it uses a plain
+// WiFiClient, but the server is HTTPS-only, so its GET fails instantly and
+// the song used to die after ~1 second. This source streams the MP3 over
+// WiFiClientSecure (via HTTPClient) instead, like the TTS download does.
+class SongHTTPSource : public AudioFileSource {
+public:
+  explicit SongHTTPSource(const char* url) { open(url); }
+  ~SongHTTPSource() { close(); }
+
+  bool open(const char* url) {
+    pos = 0;
+    size = 0;
+    stream = nullptr;
+    cl.setInsecure();
+    http.begin(cl, url);
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      Serial.printf("[SONG] stream open failed, HTTP %d\n", code);
+      http.end();
+      return false;
+    }
+    size = http.getSize();
+    stream = http.getStreamPtr();
+    Serial.printf("[SONG] stream open, %d bytes\n", (int)size);
+    return true;
+  }
+
+  uint32_t read(void* data, uint32_t len) override {
+    if (!stream) return 0;
+    uint32_t t0 = millis();
+    while (stream->available() <= 0 && millis() - t0 < 400) {
+      if (!http.connected()) return 0;
+      delay(2);
+    }
+    return readNow(data, len);
+  }
+
+  uint32_t readNonBlock(void* data, uint32_t len) override {
+    if (!stream) return 0;
+    return readNow(data, len);
+  }
+
+  bool seek(int32_t p, int dir) override { (void)p; (void)dir; return false; }
+  bool close() override { http.end(); stream = nullptr; return true; }
+  bool isOpen() override { return stream && http.connected(); }
+  uint32_t getSize() override { return (uint32_t)size; }
+  uint32_t getPos() override { return pos; }
+
+private:
+  uint32_t readNow(void* data, uint32_t len) {
+    int avail = stream->available();
+    if (avail <= 0) return 0;
+    if ((int)len > avail) len = avail;
+    int r = stream->read((uint8_t*)data, len);
+    if (r <= 0) return 0;
+    pos += (uint32_t)r;
+    return (uint32_t)r;
+  }
+
+  WiFiClientSecure cl;
+  HTTPClient http;
+  Stream* stream = nullptr;
+  int32_t size = 0;
+  uint32_t pos = 0;
+};
+
 void songTask(void* param) {
   int idx = (int)(intptr_t)param;
   String url = songs[idx].mp3Url;
-  AudioFileSourceHTTPStream* src = new AudioFileSourceHTTPStream(url.c_str());
+  SongHTTPSource* raw = new SongHTTPSource(url.c_str());
+  AudioFileSourceBuffer* src = new AudioFileSourceBuffer(raw, 32768);
   AudioGeneratorMP3* mp3 = new AudioGeneratorMP3();
-  mp3->begin(src, audioOut);
+  bool started = mp3->begin(src, audioOut);
+  if (!started) Serial.println("[SONG] mp3 begin failed");
   uint32_t startRef = millis();
   uint32_t pauseAccum = 0, pausedAt = 0;
   bool wasPaused = false;
@@ -910,6 +979,7 @@ void songTask(void* param) {
   mp3->stop();
   delete mp3;
   delete src;
+  delete raw;
   audioOut->stop();
   songActive = false;
   songPaused = false;
@@ -918,7 +988,12 @@ void songTask(void* param) {
   curSong = -1;
   gUiMode = UI_FACE;
   gState = S_IDLE;
-  setStatus("Touch to start live chat");
+  if (!started) {
+    setStatus("Song stream failed - try again");
+    delay(1500);
+  } else {
+    setStatus("Touch to start live chat");
+  }
   vTaskDelete(NULL);
 }
 
