@@ -897,7 +897,7 @@ public:
   bool open(const char* url) {
     pos = 0;
     size = 0;
-    stream = nullptr;
+    opened = false;
     cl.setInsecure();
     http.begin(cl, url);
     int code = http.GET();
@@ -907,15 +907,15 @@ public:
       return false;
     }
     size = http.getSize();
-    stream = http.getStreamPtr();
+    opened = true;
     Serial.printf("[SONG] stream open, %d bytes\n", (int)size);
     return true;
   }
 
   uint32_t read(void* data, uint32_t len) override {
-    if (!stream) return 0;
+    if (!opened) return 0;
     uint32_t t0 = millis();
-    while (stream->available() <= 0 && millis() - t0 < 400) {
+    while (cl.available() <= 0 && millis() - t0 < 400) {
       if (!http.connected()) return 0;
       delay(2);
     }
@@ -923,22 +923,22 @@ public:
   }
 
   uint32_t readNonBlock(void* data, uint32_t len) override {
-    if (!stream) return 0;
+    if (!opened) return 0;
     return readNow(data, len);
   }
 
   bool seek(int32_t p, int dir) override { (void)p; (void)dir; return false; }
-  bool close() override { http.end(); stream = nullptr; return true; }
-  bool isOpen() override { return stream && http.connected(); }
+  bool close() override { http.end(); opened = false; return true; }
+  bool isOpen() override { return opened && http.connected(); }
   uint32_t getSize() override { return (uint32_t)size; }
   uint32_t getPos() override { return pos; }
 
 private:
   uint32_t readNow(void* data, uint32_t len) {
-    int avail = stream->available();
+    int avail = cl.available();
     if (avail <= 0) return 0;
     if ((int)len > avail) len = avail;
-    int r = stream->read((uint8_t*)data, len);
+    int r = cl.read((uint8_t*)data, len);
     if (r <= 0) return 0;
     pos += (uint32_t)r;
     return (uint32_t)r;
@@ -946,7 +946,7 @@ private:
 
   WiFiClientSecure cl;
   HTTPClient http;
-  Stream* stream = nullptr;
+  bool opened = false;
   int32_t size = 0;
   uint32_t pos = 0;
 };
