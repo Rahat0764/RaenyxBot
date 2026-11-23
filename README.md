@@ -50,7 +50,8 @@ render.yaml                        one-click Render blueprint
 
    | Variable | Value |
    |---|---|
-   | `GEMINI_API_KEYS` | One or more Gemini keys, **comma-separated**: `key1,key2,key3`. If a key fails or hits its limit, the server automatically tries the next one and remembers the working key. |
+   | `GEMINI_API_KEYS` | One or more Gemini keys, **comma-separated**: `key1,key2,key3`. If a key fails or hits its limit, the server automatically tries the next one and remembers the working key. If the main model is overloaded, chat/transcribe fall back to `gemini-3.5-flash-lite`. |
+   | `XAI_API_KEYS` | Optional, comma-separated Grok (xAI) keys from [console.x.ai](https://console.x.ai). If **every** Gemini path fails, chat, transcribe and TTS automatically fall back to Grok (`grok-4.7`, `grok-voice-transcribe-2.0`, TTS voice `ara`) — a Google outage no longer silences the bot. |
    | `TELEGRAM_BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) - enables Telegram logs. |
    | `TELEGRAM_CHAT_IDS` | Comma-separated Telegram user IDs that **receive the server logs** and are the only users the bot answers. Get your ID from [@userinfobot](https://t.me/userinfobot). |
    | `SERVER_PUBLIC_URL` | This service's own URL - the Telegram webhook is registered automatically on startup. |

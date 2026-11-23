@@ -32,6 +32,10 @@ and never sent to the ESP32:
                       Calls rotate through the list: if one key fails or
                       hits its limit, the next key is tried automatically.
                       (The old single GEMINI_API_KEY also still works.)
+  XAI_API_KEYS        optional, comma-separated Grok (xAI) keys. If every
+                      Gemini path fails, chat/transcribe/TTS fall back to
+                      Grok automatically (models: XAI_CHAT_MODEL,
+                      XAI_STT_MODEL, voice XAI_TTS_VOICE).
   TELEGRAM_BOT_TOKEN  bot token from @BotFather.
   TELEGRAM_CHAT_IDS   comma-separated Telegram user/chat IDs. These IDs
                       receive the server logs AND are the only users the
@@ -83,6 +87,15 @@ CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
 # chat/transcribe fall back to these models, in order. A demand spike is
 # per-model, so a quieter model usually answers immediately.
 FALLBACK_MODELS = _parse_csv("GEMINI_FALLBACK_MODELS") or ["gemini-3.5-flash-lite"]
+
+# Grok (xAI) is the second-provider fallback: if every Gemini path fails,
+# chat, transcribe and TTS are retried against the xAI API with these keys,
+# so a Google outage no longer silences the bot.
+XAI_API_KEYS = _parse_csv("XAI_API_KEYS") or _parse_csv("XAI_API_KEY")
+XAI_BASE = "https://api.x.ai/v1"
+XAI_CHAT_MODEL = os.environ.get("XAI_CHAT_MODEL", "grok-4.7")
+XAI_STT_MODEL = os.environ.get("XAI_STT_MODEL", "grok-voice-transcribe-2.0")
+XAI_TTS_VOICE = os.environ.get("XAI_TTS_VOICE", "ara")
 TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
 
@@ -198,6 +211,133 @@ def run_chat_model(fn, what: str):
     raise last_exc
 
 
+# ------------------------------------------------------------ Grok (xAI) --
+_xai_idx = 0  # the xAI key that worked most recently
+
+
+def _xai_request(path: str, key: str, data: bytes, content_type: str,
+                 timeout: int = 90) -> bytes:
+    req = urllib.request.Request(
+        XAI_BASE + path,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": content_type,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        # xAI explains itself in the body (e.g. 400 = "Incorrect API key
+        # provided") — keep it in the error so logs stay meaningful.
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"xAI HTTP {e.code}: {detail or e.reason}")
+
+
+def run_xai(fn, what: str):
+    """Run fn(api_key) against the xAI key pool, rotating on failure —
+    the Grok mirror of run_gemini. Raises 502 if all keys fail."""
+    global _xai_idx
+    if not XAI_API_KEYS:
+        raise HTTPException(503, "XAI_API_KEYS is not set on the server")
+    n = len(XAI_API_KEYS)
+    start = _xai_idx
+    last_exc = None
+    for step in range(n):
+        idx = (start + step) % n
+        try:
+            out = fn(XAI_API_KEYS[idx])
+            _xai_idx = idx
+            return out
+        except HTTPException:
+            raise
+        except Exception as e:
+            last_exc = e
+            print(f"[xai] key #{idx + 1} failed ({what}): {e}")
+            tg_log(f"⚠️ Grok key #{idx + 1} of {n} failed ({what}).\n{e}")
+    raise HTTPException(502, f"all Grok keys failed: {last_exc}")
+
+
+def grok_chat_reply(body) -> str:
+    """Chat completion via Grok (OpenAI-compatible chat API)."""
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for h in body.history[-8:]:
+        msgs.append({
+            "role": "assistant" if h.get("role") == "assistant" else "user",
+            "content": h.get("content", ""),
+        })
+    msgs.append({"role": "user", "content": body.text})
+
+    def _do(key):
+        raw = _xai_request(
+            "/chat/completions", key,
+            json.dumps({
+                "model": XAI_CHAT_MODEL,
+                "messages": msgs,
+                "temperature": 0.7,
+                "max_tokens": 300,
+            }).encode(),
+            "application/json",
+        )
+        data = json.loads(raw)
+        return (data["choices"][0]["message"]["content"] or "").strip()
+
+    return run_xai(_do, "chat (grok)")
+
+
+def grok_transcribe(audio: bytes) -> str:
+    """Speech-to-text via Grok STT. The API wants the file field LAST in
+    the multipart form, after every other field."""
+    boundary = f"----raenyx{int(time.time() * 1000)}"
+
+    def _do(key):
+        parts = [
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="model"\r\n\r\n'
+                f"{XAI_STT_MODEL}\r\n"
+            ).encode(),
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; '
+                f'filename="audio.wav"\r\n'
+                f"Content-Type: audio/wav\r\n\r\n"
+            ).encode() + audio + b"\r\n",
+            f"--{boundary}--\r\n".encode(),
+        ]
+        raw = _xai_request(
+            "/stt", key, b"".join(parts),
+            f"multipart/form-data; boundary={boundary}", timeout=120,
+        )
+        data = json.loads(raw)
+        return (data.get("text") or data.get("transcript") or "").strip()
+
+    return run_xai(_do, "transcribe (grok)")
+
+
+def grok_tts(text: str) -> bytes:
+    """Text-to-speech via Grok TTS, returned as 24 kHz WAV — the same
+    shape the ESP32 already expects from /api/tts."""
+
+    def _do(key):
+        return _xai_request(
+            "/tts", key,
+            json.dumps({
+                "text": text,
+                "voice_id": XAI_TTS_VOICE,
+                "language": "auto",
+                "output_format": {"codec": "wav", "sample_rate": 24000},
+            }).encode(),
+            "application/json", timeout=120,
+        )
+
+    return run_xai(_do, "tts (grok)")
+
+
 # --------------------------------------------------------------------------
 # Song library: scan songs/ and build the catalogue automatically
 # --------------------------------------------------------------------------
@@ -306,6 +446,7 @@ def health():
         "status": "ok",
         "songs": len(scan_songs()),
         "gemini_keys": len(GEMINI_API_KEYS),
+        "xai_keys": len(XAI_API_KEYS),
         "active_key": _key_idx + 1 if GEMINI_API_KEYS else 0,
         "telegram_log": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS),
     }
@@ -422,55 +563,69 @@ class TtsIn(BaseModel):
 
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...)):
-    from google.genai import types
-
     audio = await file.read()
     if len(audio) < 1000:
         raise HTTPException(400, "audio too short")
 
-    def _do(client, model):
-        return client.models.generate_content(
-            model=model,
-            contents=[
-                types.Part.from_bytes(data=audio, mime_type="audio/wav"),
-                "Transcribe this audio exactly as spoken, word for word. "
-                "Reply with the transcription only, no comments.",
-            ],
-        )
+    try:
+        from google.genai import types
 
-    resp = run_chat_model(_do, "transcribe")
-    return {"text": (resp.text or "").strip()}
+        def _do(client, model):
+            return client.models.generate_content(
+                model=model,
+                contents=[
+                    types.Part.from_bytes(data=audio, mime_type="audio/wav"),
+                    "Transcribe this audio exactly as spoken, word for word. "
+                    "Reply with the transcription only, no comments.",
+                ],
+            )
+
+        resp = run_chat_model(_do, "transcribe")
+        return {"text": (resp.text or "").strip()}
+    except Exception:
+        if not XAI_API_KEYS:
+            raise
+        tg_log("↪️ transcribe: Gemini down — transcribing with Grok")
+        return {"text": grok_transcribe(audio)}
 
 
 @app.post("/api/chat")
 def chat(body: ChatIn):
-    from google.genai import types
+    via_grok = False
+    try:
+        from google.genai import types
 
-    contents = []
-    for h in body.history[-8:]:
-        role = "model" if h.get("role") == "assistant" else "user"
-        contents.append(
-            types.Content(role=role, parts=[types.Part(text=h.get("content", ""))])
-        )
-    contents.append(types.Content(role="user", parts=[types.Part(text=body.text)]))
+        contents = []
+        for h in body.history[-8:]:
+            role = "model" if h.get("role") == "assistant" else "user"
+            contents.append(
+                types.Content(role=role, parts=[types.Part(text=h.get("content", ""))])
+            )
+        contents.append(types.Content(role="user", parts=[types.Part(text=body.text)]))
 
-    def _do(client, model):
-        return client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.7,
-                max_output_tokens=300,
-            ),
-        )
+        def _do(client, model):
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.7,
+                    max_output_tokens=300,
+                ),
+            )
 
-    resp = run_chat_model(_do, "chat")
-    reply = (resp.text or "").strip()
+        resp = run_chat_model(_do, "chat")
+        reply = (resp.text or "").strip()
+    except Exception:
+        if not XAI_API_KEYS:
+            raise
+        tg_log("↪️ chat: Gemini down — answering with Grok")
+        reply = grok_chat_reply(body)
+        via_grok = True
     reply = re.sub(r"[*#`_>]+", "", reply).strip()
     if not reply:
-        raise HTTPException(502, "empty reply from Gemini")
-    tg_log(f"💬 {body.text}\n🤖 {reply}")
+        raise HTTPException(502, "empty reply")
+    tg_log(f"💬 {body.text}\n🤖 {reply}" + (" (via Grok)" if via_grok else ""))
     return {"reply": reply}
 
 
@@ -510,5 +665,11 @@ def tts(body: TtsIn):
             raise RuntimeError("no audio from Gemini TTS")
         return base64.b64decode(out.data)
 
-    wav = run_gemini(_do, "tts")
+    try:
+        wav = run_gemini(_do, "tts")
+    except Exception:
+        if not XAI_API_KEYS:
+            raise
+        tg_log("↪️ tts: Gemini down — speaking with Grok")
+        wav = grok_tts(text)
     return Response(content=wav, media_type="audio/wav")
