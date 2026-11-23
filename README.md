@@ -46,8 +46,20 @@ render.yaml                        one-click Render blueprint
 
 1. Push this repo to GitHub (it already is) and in Render choose
    **New -> Blueprint**, pick the repo - `render.yaml` does the rest.
-2. In the service's **Environment** tab set `GEMINI_API_KEY`
-   (get one from Google AI Studio). Never commit the key.
+2. In the service's **Environment** tab set the variables below.
+   Never commit real values.
+
+   | Variable | Value |
+   |---|---|
+   | `GEMINI_API_KEYS` | One or more Gemini keys, **comma-separated**: `key1,key2,key3`. If a key fails or hits its limit, the server automatically tries the next one and remembers the working key. |
+   | `TELEGRAM_BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) - enables Telegram logs. |
+   | `TELEGRAM_CHAT_IDS` | Comma-separated Telegram user IDs that **receive the server logs** and are the only users the bot answers. Get your ID from [@userinfobot](https://t.me/userinfobot). |
+   | `SERVER_PUBLIC_URL` | This service's own URL - the Telegram webhook is registered automatically on startup. |
+
+   With Telegram set up you get a log message on server start, for every
+   chat question/answer, and whenever a Gemini key fails over - and you
+   can send the bot `/status`, `/songs` and `/keys`. Anyone not in
+   `TELEGRAM_CHAT_IDS` is ignored.
 3. Your server URL will be like `https://raenyxbot.onrender.com`.
 4. Keep it awake: create a free **UptimeRobot** HTTP monitor for
    `https://raenyxbot.onrender.com/health` with a 5-minute interval,

@@ -9,7 +9,20 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: GEMINI_API_KEY
+      # Comma-separated Gemini keys, e.g. "key1,key2,key3" - if one key
+      # fails or hits its limit, the server automatically tries the next.
+      - key: GEMINI_API_KEYS
         sync: false # set the real value in the Render dashboard, never in git
+      # Telegram log bot: token from @BotFather...
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      # ...and the comma-separated user/chat IDs that receive the logs
+      # and are allowed to command the bot, e.g. "123456789,987654321".
+      - key: TELEGRAM_CHAT_IDS
+        sync: false
+      # This service's own public URL - used to auto-register the
+      # Telegram webhook on startup.
+      - key: SERVER_PUBLIC_URL
+        value: https://raenyxbot.onrender.com
       - key: PYTHON_VERSION
         value: 3.12.4

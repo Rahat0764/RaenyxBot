@@ -25,20 +25,33 @@ What it does
 
 3. GET /health  -> {"status": "ok", "songs": n}   (UptimeRobot pings this)
 
-Secrets: GEMINI_API_KEY is read from the environment (Render dashboard).
-It is never stored in this repo and never sent to the ESP32.
+Secrets come from the environment (Render dashboard), never from this repo
+and never sent to the ESP32:
+
+  GEMINI_API_KEYS     comma-separated list, e.g. "key1,key2,key3".
+                      Calls rotate through the list: if one key fails or
+                      hits its limit, the next key is tried automatically.
+                      (The old single GEMINI_API_KEY also still works.)
+  TELEGRAM_BOT_TOKEN  bot token from @BotFather.
+  TELEGRAM_CHAT_IDS   comma-separated Telegram user/chat IDs. These IDs
+                      receive the server logs AND are the only users the
+                      bot answers (try /status, /songs, /keys in Telegram).
+  SERVER_PUBLIC_URL   optional, e.g. https://raenyxbot.onrender.com -
+                      if set, the Telegram webhook is registered on startup.
 """
 
-import io
 import json
 import os
 import re
 import struct
+import threading
+import time
 import unicodedata
+import urllib.request
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 # --------------------------------------------------------------------------
@@ -49,7 +62,21 @@ BASE_DIR = Path(__file__).resolve().parent
 SONGS_DIR = BASE_DIR / "songs"
 SONGS_DIR.mkdir(exist_ok=True)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+def _parse_csv(name: str) -> list[str]:
+    return [p.strip() for p in os.environ.get(name, "").split(",") if p.strip()]
+
+
+# Many keys, comma-separated. If a key fails or its limit is exhausted,
+# the next one is used automatically (see run_gemini below).
+GEMINI_API_KEYS = _parse_csv("GEMINI_API_KEYS") or _parse_csv("GEMINI_API_KEY")
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+# These IDs get the logs and are the only users the bot answers.
+TELEGRAM_CHAT_IDS = _parse_csv("TELEGRAM_CHAT_IDS") or _parse_csv(
+    "TELEGRAM_AUTHORIZED_IDS"
+)
+SERVER_PUBLIC_URL = os.environ.get("SERVER_PUBLIC_URL", "").rstrip("/")
+
 CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
 TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
@@ -64,19 +91,82 @@ SYSTEM_PROMPT = (
 
 app = FastAPI(title="RaenyxBot server")
 
-_gemini_client = None
+START_TIME = time.time()
+
+# ------------------------------------------------------------ Telegram log --
+def _tg_send(chat_id: str, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        data = json.dumps(
+            {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True}
+        ).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:  # logging must never break the server
+        print(f"[telegram] send failed: {e}")
 
 
-def gemini():
-    """Lazy-init the Gemini client so /health and /songs work without a key."""
-    global _gemini_client
-    if _gemini_client is None:
-        if not GEMINI_API_KEY:
-            raise HTTPException(503, "GEMINI_API_KEY is not set on the server")
+def tg_log(text: str):
+    """Send a log line to every authorized Telegram chat, in the background
+    so a slow Telegram API never delays the ESP32's answer."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+        return
+
+    def _run():
+        for cid in TELEGRAM_CHAT_IDS:
+            _tg_send(cid, text)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ------------------------------------------------------- Gemini key pool --
+_clients: dict[int, object] = {}
+_key_idx = 0  # the key that worked most recently; calls start from here
+
+
+def _client_for(idx: int):
+    if idx not in _clients:
         from google import genai
 
-        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _gemini_client
+        _clients[idx] = genai.Client(api_key=GEMINI_API_KEYS[idx])
+    return _clients[idx]
+
+
+def run_gemini(fn, what: str):
+    """Run fn(client) with the current Gemini key. If it fails (quota,
+    limit, auth, server error), log it and try the next key, wrapping
+    around the whole comma-separated list. Raises 502 if all keys fail."""
+    global _key_idx
+    if not GEMINI_API_KEYS:
+        raise HTTPException(503, "GEMINI_API_KEYS is not set on the server")
+    n = len(GEMINI_API_KEYS)
+    start = _key_idx
+    last_exc = None
+    for step in range(n):
+        idx = (start + step) % n
+        try:
+            out = fn(_client_for(idx))
+            if idx != start:
+                tg_log(f"✅ Gemini: switched to key #{idx + 1} of {n} ({what})")
+            _key_idx = idx
+            return out
+        except HTTPException:
+            raise
+        except Exception as e:
+            last_exc = e
+            code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            print(f"[gemini] key #{idx + 1} failed ({what}, code={code}): {e}")
+            tg_log(
+                f"⚠️ Gemini key #{idx + 1} of {n} failed ({what}, code={code}). "
+                f"Trying the next key...\n{e}"
+            )
+    tg_log(f"❌ All {n} Gemini keys failed ({what}):\n{last_exc}")
+    raise HTTPException(502, f"all Gemini keys failed: {last_exc}")
 
 
 # --------------------------------------------------------------------------
@@ -183,7 +273,84 @@ def root():
 @app.get("/health")
 def health():
     # UptimeRobot pings this every 5 minutes so Render never spins down.
-    return {"status": "ok", "songs": len(scan_songs())}
+    return {
+        "status": "ok",
+        "songs": len(scan_songs()),
+        "gemini_keys": len(GEMINI_API_KEYS),
+        "active_key": _key_idx + 1 if GEMINI_API_KEYS else 0,
+        "telegram_log": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS),
+    }
+
+
+@app.on_event("startup")
+def _startup():
+    songs = scan_songs()
+    names = ", ".join(s["id"] for s in songs) or "(none yet)"
+    tg_log(
+        "🟢 RaenyxBot server started\n"
+        f"🔑 Gemini keys loaded: {len(GEMINI_API_KEYS)}\n"
+        f"🎵 Songs ({len(songs)}): {names}"
+    )
+    # Register the Telegram webhook so authorized users can send commands.
+    if TELEGRAM_BOT_TOKEN and SERVER_PUBLIC_URL:
+        def _set_hook():
+            try:
+                data = json.dumps(
+                    {"url": f"{SERVER_PUBLIC_URL}/telegram/webhook"}
+                ).encode()
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req, timeout=10).read()
+                print("[telegram] webhook registered")
+            except Exception as e:
+                print(f"[telegram] setWebhook failed: {e}")
+
+        threading.Thread(target=_set_hook, daemon=True).start()
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Commands from authorized Telegram users only: /status /songs /keys."""
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
+    msg = update.get("message") or update.get("edited_message") or {}
+    uid = str((msg.get("from") or {}).get("id", ""))
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return {"ok": True}
+    if uid not in TELEGRAM_CHAT_IDS and chat_id not in TELEGRAM_CHAT_IDS:
+        tg_log(f"🚫 Unauthorized Telegram user {uid} tried: {text}")
+        return {"ok": True}
+
+    cmd = text.split()[0].lower()
+    if cmd in ("/start", "/status"):
+        up = int(time.time() - START_TIME)
+        reply = (
+            "🤖 RaenyxBot server is running\n"
+            f"⏱ Uptime: {up // 3600}h {(up % 3600) // 60}m\n"
+            f"🔑 Gemini keys: {len(GEMINI_API_KEYS)} (active #{_key_idx + 1})\n"
+            f"🎵 Songs: {len(scan_songs())}"
+        )
+    elif cmd == "/songs":
+        songs = scan_songs()
+        lines = [f"🎵 {s['title']} - {s['artist']}".rstrip(" -") for s in songs]
+        reply = "\n".join(lines) if lines else "No songs yet."
+    elif cmd == "/keys":
+        reply = (
+            f"🔑 {len(GEMINI_API_KEYS)} Gemini keys loaded, "
+            f"currently using #{_key_idx + 1}. "
+            "A failing key is skipped automatically."
+        )
+    else:
+        reply = "Commands: /status  /songs  /keys"
+    _tg_send(chat_id, reply)
+    return {"ok": True}
 
 
 @app.get("/songs.json")
@@ -231,14 +398,18 @@ async def transcribe(file: UploadFile = File(...)):
     audio = await file.read()
     if len(audio) < 1000:
         raise HTTPException(400, "audio too short")
-    resp = gemini().models.generate_content(
-        model=CHAT_MODEL,
-        contents=[
-            types.Part.from_bytes(data=audio, mime_type="audio/wav"),
-            "Transcribe this audio exactly as spoken, word for word. "
-            "Reply with the transcription only, no comments.",
-        ],
-    )
+
+    def _do(client):
+        return client.models.generate_content(
+            model=CHAT_MODEL,
+            contents=[
+                types.Part.from_bytes(data=audio, mime_type="audio/wav"),
+                "Transcribe this audio exactly as spoken, word for word. "
+                "Reply with the transcription only, no comments.",
+            ],
+        )
+
+    resp = run_gemini(_do, "transcribe")
     return {"text": (resp.text or "").strip()}
 
 
@@ -254,19 +425,23 @@ def chat(body: ChatIn):
         )
     contents.append(types.Content(role="user", parts=[types.Part(text=body.text)]))
 
-    resp = gemini().models.generate_content(
-        model=CHAT_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.7,
-            max_output_tokens=300,
-        ),
-    )
+    def _do(client):
+        return client.models.generate_content(
+            model=CHAT_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.7,
+                max_output_tokens=300,
+            ),
+        )
+
+    resp = run_gemini(_do, "chat")
     reply = (resp.text or "").strip()
     reply = re.sub(r"[*#`_>]+", "", reply).strip()
     if not reply:
         raise HTTPException(502, "empty reply from Gemini")
+    tg_log(f"💬 {body.text}\n🤖 {reply}")
     return {"reply": reply}
 
 
@@ -287,20 +462,23 @@ def tts(body: TtsIn):
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "empty text")
-    resp = gemini().models.generate_content(
-        model=TTS_MODEL,
-        contents=text,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=body.voice or TTS_VOICE
+    def _do(client):
+        return client.models.generate_content(
+            model=TTS_MODEL,
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=body.voice or TTS_VOICE
+                        )
                     )
-                )
+                ),
             ),
-        ),
-    )
+        )
+
+    resp = run_gemini(_do, "tts")
     pcm = resp.candidates[0].content.parts[0].inline_data.data
     if not pcm:
         raise HTTPException(502, "no audio from Gemini TTS")
