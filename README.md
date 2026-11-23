@@ -51,7 +51,7 @@ render.yaml                        one-click Render blueprint
    | Variable | Value |
    |---|---|
    | `GEMINI_API_KEYS` | One or more Gemini keys, **comma-separated**: `key1,key2,key3`. If a key fails or hits its limit, the server automatically tries the next one and remembers the working key. If the main model is overloaded, chat/transcribe fall back to `gemini-3.5-flash-lite`. |
-   | `GROQ_API_KEYS` | Optional, comma-separated Groq keys from [console.groq.com](https://console.groq.com). If **every** Gemini path fails, transcribe (Whisper `whisper-large-v3-turbo`) and chat (`openai/gpt-oss-120b`) automatically fall back to Groq — the provider this bot ran on originally. TTS stays on Gemini (Groq's TTS has no Bangla voice). Use fresh keys — never ones that were shared in chat. |
+   | `GROQ_API_KEYS` | Comma-separated Groq keys from [console.groq.com](https://console.groq.com). Groq is the **primary** provider for transcribe (Whisper `whisper-large-v3-turbo`) and chat (`openai/gpt-oss-120b`); Gemini is the fallback for both. TTS stays on Gemini (Groq's TTS has no Bangla voice). Use fresh keys — never ones that were shared in chat. |
    | `TELEGRAM_BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) - enables Telegram logs. |
    | `TELEGRAM_CHAT_IDS` | Comma-separated Telegram user IDs that **receive the server logs** and are the only users the bot answers. Get your ID from [@userinfobot](https://t.me/userinfobot). |
    | `SERVER_PUBLIC_URL` | This service's own URL - the Telegram webhook is registered automatically on startup. |

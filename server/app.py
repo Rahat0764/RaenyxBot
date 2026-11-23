@@ -32,10 +32,10 @@ and never sent to the ESP32:
                       Calls rotate through the list: if one key fails or
                       hits its limit, the next key is tried automatically.
                       (The old single GEMINI_API_KEY also still works.)
-  GROQ_API_KEYS       optional, comma-separated Groq keys. If every Gemini
-                      path fails, transcribe (Whisper) and chat fall back
-                      to Groq automatically (GROQ_CHAT_MODEL,
-                      GROQ_STT_MODEL). TTS stays on Gemini.
+  GROQ_API_KEYS       comma-separated Groq keys. Groq is PRIMARY for
+                      transcribe (Whisper, GROQ_STT_MODEL) and chat
+                      (GROQ_CHAT_MODEL); Gemini is their fallback.
+                      TTS is Gemini-only.
   TELEGRAM_BOT_TOKEN  bot token from @BotFather.
   TELEGRAM_CHAT_IDS   comma-separated Telegram user/chat IDs. These IDs
                       receive the server logs AND are the only users the
@@ -88,10 +88,10 @@ CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
 # per-model, so a quieter model usually answers immediately.
 FALLBACK_MODELS = _parse_csv("GEMINI_FALLBACK_MODELS") or ["gemini-3.5-flash-lite"]
 
-# Groq is the second-provider fallback for hearing + thinking: if every
-# Gemini path fails, transcribe (Whisper) and chat fall back to Groq —
-# the same provider this bot ran on originally. TTS stays on Gemini:
-# Groq's TTS (Orpheus) speaks English/Arabic only, no Bangla.
+# Groq is the PRIMARY provider for hearing + thinking (it is what this
+# bot ran on originally, and it is fast): transcribe uses its Whisper,
+# chat uses gpt-oss-120b. Gemini is the fallback for both. TTS stays on
+# Gemini only: Groq's TTS (Orpheus) speaks English/Arabic, no Bangla.
 GROQ_API_KEYS = _parse_csv("GROQ_API_KEYS") or _parse_csv("GROQ_API_KEY")
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_CHAT_MODEL = os.environ.get("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
@@ -285,7 +285,9 @@ def groq_chat_reply(body) -> str:
                 "model": GROQ_CHAT_MODEL,
                 "messages": msgs,
                 "temperature": 0.7,
-                "max_tokens": 300,
+                # gpt-oss is a reasoning model: leave headroom so the
+                # reasoning tokens cannot starve the actual reply.
+                "max_tokens": 800,
             }).encode(),
             "application/json",
         )
@@ -553,32 +555,43 @@ async def transcribe(file: UploadFile = File(...)):
     if len(audio) < 1000:
         raise HTTPException(400, "audio too short")
 
-    try:
-        from google.genai import types
+    # Groq (Whisper) is the primary ear; Gemini is the fallback.
+    if GROQ_API_KEYS:
+        try:
+            return {"text": groq_transcribe(audio)}
+        except Exception:
+            tg_log("↪️ transcribe: Groq down — transcribing with Gemini")
 
-        def _do(client, model):
-            return client.models.generate_content(
-                model=model,
-                contents=[
-                    types.Part.from_bytes(data=audio, mime_type="audio/wav"),
-                    "Transcribe this audio exactly as spoken, word for word. "
-                    "Reply with the transcription only, no comments.",
-                ],
-            )
+    from google.genai import types
 
-        resp = run_chat_model(_do, "transcribe")
-        return {"text": (resp.text or "").strip()}
-    except Exception:
-        if not GROQ_API_KEYS:
-            raise
-        tg_log("↪️ transcribe: Gemini down — transcribing with Groq")
-        return {"text": groq_transcribe(audio)}
+    def _do(client, model):
+        return client.models.generate_content(
+            model=model,
+            contents=[
+                types.Part.from_bytes(data=audio, mime_type="audio/wav"),
+                "Transcribe this audio exactly as spoken, word for word. "
+                "Reply with the transcription only, no comments.",
+            ],
+        )
+
+    resp = run_chat_model(_do, "transcribe")
+    return {"text": (resp.text or "").strip()}
 
 
 @app.post("/api/chat")
 def chat(body: ChatIn):
-    via_groq = False
-    try:
+    reply = None
+    provider = None
+    # Groq is the primary brain; Gemini is the fallback.
+    if GROQ_API_KEYS:
+        try:
+            r = groq_chat_reply(body)
+            if not r:
+                raise RuntimeError("empty reply from Groq")
+            reply, provider = r, "Groq"
+        except Exception:
+            tg_log("↪️ chat: Groq down — answering with Gemini")
+    if reply is None:
         from google.genai import types
 
         contents = []
@@ -602,16 +615,11 @@ def chat(body: ChatIn):
 
         resp = run_chat_model(_do, "chat")
         reply = (resp.text or "").strip()
-    except Exception:
-        if not GROQ_API_KEYS:
-            raise
-        tg_log("↪️ chat: Gemini down — answering with Groq")
-        reply = groq_chat_reply(body)
-        via_groq = True
+        provider = "Gemini"
     reply = re.sub(r"[*#`_>]+", "", reply).strip()
     if not reply:
         raise HTTPException(502, "empty reply")
-    tg_log(f"💬 {body.text}\n🤖 {reply}" + (" (via Groq)" if via_groq else ""))
+    tg_log(f"💬 {body.text}\n🤖 {reply} (via {provider})")
     return {"reply": reply}
 
 
