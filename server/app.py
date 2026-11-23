@@ -251,7 +251,12 @@ def run_groq(fn, what: str):
     for step in range(n):
         idx = (start + step) % n
         try:
-            out = fn(GROQ_API_KEYS[idx])
+            try:
+                out = fn(GROQ_API_KEYS[idx])
+            except (urllib.error.URLError, ConnectionError):
+                # A dropped connection says nothing about the key —
+                # retry the same key once before rotating.
+                out = fn(GROQ_API_KEYS[idx])
             _groq_idx = idx
             return out
         except HTTPException:
