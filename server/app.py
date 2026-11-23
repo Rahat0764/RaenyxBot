@@ -79,6 +79,10 @@ TELEGRAM_CHAT_IDS = _parse_csv("TELEGRAM_CHAT_IDS") or _parse_csv(
 SERVER_PUBLIC_URL = os.environ.get("SERVER_PUBLIC_URL", "").rstrip("/")
 
 CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
+# If the primary chat model is overloaded (503 high demand) on every key,
+# chat/transcribe fall back to these models, in order. A demand spike is
+# per-model, so a quieter model usually answers immediately.
+FALLBACK_MODELS = _parse_csv("GEMINI_FALLBACK_MODELS") or ["gemini-3.5-flash-lite"]
 TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
 
@@ -175,6 +179,23 @@ def run_gemini(fn, what: str):
             )
     tg_log(f"❌ All {n} Gemini keys failed ({what}):\n{last_exc}")
     raise HTTPException(502, f"all Gemini keys failed: {last_exc}")
+
+
+def run_chat_model(fn, what: str):
+    """fn(client, model) for chat/transcribe. Try the primary model across
+    all keys first; if it fails everywhere (e.g. a 503 demand spike, which
+    is per-model), retry with each fallback model so one busy model never
+    silences the bot."""
+    models = [CHAT_MODEL] + [m for m in FALLBACK_MODELS if m != CHAT_MODEL]
+    last_exc = None
+    for i, m in enumerate(models):
+        try:
+            return run_gemini(lambda c, m=m: fn(c, m), what)
+        except HTTPException as e:
+            last_exc = e
+            if i + 1 < len(models):
+                tg_log(f"↪️ {what}: {m} unavailable — falling back to {models[i + 1]}")
+    raise last_exc
 
 
 # --------------------------------------------------------------------------
@@ -407,9 +428,9 @@ async def transcribe(file: UploadFile = File(...)):
     if len(audio) < 1000:
         raise HTTPException(400, "audio too short")
 
-    def _do(client):
+    def _do(client, model):
         return client.models.generate_content(
-            model=CHAT_MODEL,
+            model=model,
             contents=[
                 types.Part.from_bytes(data=audio, mime_type="audio/wav"),
                 "Transcribe this audio exactly as spoken, word for word. "
@@ -417,7 +438,7 @@ async def transcribe(file: UploadFile = File(...)):
             ],
         )
 
-    resp = run_gemini(_do, "transcribe")
+    resp = run_chat_model(_do, "transcribe")
     return {"text": (resp.text or "").strip()}
 
 
@@ -433,9 +454,9 @@ def chat(body: ChatIn):
         )
     contents.append(types.Content(role="user", parts=[types.Part(text=body.text)]))
 
-    def _do(client):
+    def _do(client, model):
         return client.models.generate_content(
-            model=CHAT_MODEL,
+            model=model,
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
@@ -444,7 +465,7 @@ def chat(body: ChatIn):
             ),
         )
 
-    resp = run_gemini(_do, "chat")
+    resp = run_chat_model(_do, "chat")
     reply = (resp.text or "").strip()
     reply = re.sub(r"[*#`_>]+", "", reply).strip()
     if not reply:
