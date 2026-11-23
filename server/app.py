@@ -133,8 +133,15 @@ _key_idx = 0  # the key that worked most recently; calls start from here
 def _client_for(idx: int):
     if idx not in _clients:
         from google import genai
+        from google.genai import types
 
-        _clients[idx] = genai.Client(api_key=GEMINI_API_KEYS[idx])
+        # v1beta: the current TTS models (gemini-3.8-flash-tts) and the
+        # Interactions API are only served there; the default v1 endpoint
+        # answers "model not found" for them.
+        _clients[idx] = genai.Client(
+            api_key=GEMINI_API_KEYS[idx],
+            http_options=types.HttpOptions(api_version="v1beta"),
+        )
     return _clients[idx]
 
 
