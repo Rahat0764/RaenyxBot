@@ -40,6 +40,7 @@ and never sent to the ESP32:
                       if set, the Telegram webhook is registered on startup.
 """
 
+import base64
 import json
 import os
 import re
@@ -77,8 +78,8 @@ TELEGRAM_CHAT_IDS = _parse_csv("TELEGRAM_CHAT_IDS") or _parse_csv(
 )
 SERVER_PUBLIC_URL = os.environ.get("SERVER_PUBLIC_URL", "").rstrip("/")
 
-CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
-TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
+TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
 
 SYSTEM_PROMPT = (
@@ -457,29 +458,29 @@ def wrap_wav(pcm: bytes, rate: int = 24000) -> bytes:
 
 @app.post("/api/tts")
 def tts(body: TtsIn):
-    from google.genai import types
-
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "empty text")
-    def _do(client):
-        return client.models.generate_content(
-            model=TTS_MODEL,
-            contents=text,
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name=body.voice or TTS_VOICE
-                        )
-                    )
-                ),
-            ),
-        )
 
-    resp = run_gemini(_do, "tts")
-    pcm = resp.candidates[0].content.parts[0].inline_data.data
-    if not pcm:
-        raise HTTPException(502, "no audio from Gemini TTS")
-    return Response(content=wrap_wav(pcm), media_type="audio/wav")
+    def _do(client):
+        # Gemini 3.8 TTS runs on the Interactions API (the old generateContent
+        # speechConfig path is rejected for the new models). output_audio
+        # already carries a complete WAV file, base64-encoded.
+        interaction = client.interactions.create(
+            model=TTS_MODEL,
+            input=[{
+                "type": "user_input",
+                "content": [{"type": "text", "text": text}],
+            }],
+            response_format={"type": "audio"},
+            generation_config={
+                "speech_config": [{"voice": body.voice or TTS_VOICE}]
+            },
+        )
+        out = getattr(interaction, "output_audio", None)
+        if out is None or not getattr(out, "data", None):
+            raise RuntimeError("no audio from Gemini TTS")
+        return base64.b64decode(out.data)
+
+    wav = run_gemini(_do, "tts")
+    return Response(content=wav, media_type="audio/wav")
